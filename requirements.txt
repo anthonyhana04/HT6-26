@@ -1,0 +1,19 @@
+# Core
+pydantic>=2.7
+pydantic-settings>=2.3
+python-dotenv>=1.0
+rich>=13.7
+
+# LLM provider SDKs
+openai>=1.40          # also used by the DeepSeek agent (OpenAI-compatible API)
+anthropic>=0.34
+google-genai>=0.3
+groq>=0.11
+
+# Speech (ElevenLabs streaming TTS + local PCM playback)
+elevenlabs>=2.0
+sounddevice>=0.4      # PortAudio bindings; plays raw PCM to the speaker
+numpy>=1.26           # RMS amplitude metering for the LED event stream
+
+# Future (API) — declared now so the architecture is honest about intent.
+# fastapi>=0.111
