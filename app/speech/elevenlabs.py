@@ -43,6 +43,7 @@ class ElevenLabsSpeech(SpeechBackend):
         voice_ids: dict[str, str | None],
         *,
         model_id: str = "eleven_flash_v2_5",
+        device: str | int | None = None,
         console: Console | None = None,
         client: Any | None = None,
     ) -> None:
@@ -52,6 +53,9 @@ class ElevenLabsSpeech(SpeechBackend):
             client = AsyncElevenLabs(api_key=api_key)
         self._client = client
         self._model_id = model_id
+        # Which output device to play through. None = PortAudio default. May be
+        # a device index or a substring of its name (e.g. "pulse", "pipewire").
+        self._device = device
         self._console = console or Console()
         # name -> voice_id (values may be None until auto-assigned).
         self._voice_ids: dict[str, str | None] = dict(voice_ids)
@@ -78,7 +82,7 @@ class ElevenLabsSpeech(SpeechBackend):
             logger.warning("No ElevenLabs voice for %s; printing without audio", event.speaker)
             return
 
-        player = _AudioPlayer(_SAMPLE_RATE) if self._audio_ok else None
+        player = _AudioPlayer(_SAMPLE_RATE, self._device) if self._audio_ok else None
         if player is not None and not player.ok:
             self._audio_ok = False
             player = None
@@ -137,15 +141,20 @@ class ElevenLabsSpeech(SpeechBackend):
 class _AudioPlayer:
     """Thin real-time PCM player over sounddevice; no-ops if audio is absent."""
 
-    def __init__(self, sample_rate: int) -> None:
+    def __init__(self, sample_rate: int, device: str | int | None = None) -> None:
         self._stream = None
         self.ok = False
         try:
             import sounddevice as sd
 
-            self._stream = sd.RawOutputStream(samplerate=sample_rate, channels=1, dtype="int16")
+            resolved = _resolve_device(sd, device)
+            self._stream = sd.RawOutputStream(
+                samplerate=sample_rate, channels=1, dtype="int16", device=resolved
+            )
             self._stream.start()
             self.ok = True
+            if resolved is not None:
+                logger.info("Playing audio through device %r", sd.query_devices(resolved)["name"])
         except Exception:  # noqa: BLE001 — headless/CI or no PortAudio device
             logger.warning("Audio output unavailable; speaking silently", exc_info=True)
 
@@ -164,6 +173,23 @@ class _AudioPlayer:
             stream.close()
         except Exception:  # noqa: BLE001
             pass
+
+
+def _resolve_device(sd: Any, device: str | int | None) -> int | None:
+    """Turn a device index or name-substring into a PortAudio device index."""
+    if device is None:
+        return None
+    if isinstance(device, int):
+        return device
+    text = device.strip()
+    if text.isdigit():
+        return int(text)
+    lowered = text.lower()
+    for index, info in enumerate(sd.query_devices()):
+        if info.get("max_output_channels", 0) > 0 and lowered in info["name"].lower():
+            return index
+    logger.warning("No output device matching %r; using system default", device)
+    return None
 
 
 def _rms_amplitude(chunk: bytes) -> float:

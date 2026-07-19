@@ -24,11 +24,14 @@ from app.council.council import Council
 from app.council.moderator import Moderator, ModeratorConfig
 from app.council.scheduler import Scheduler
 from app.events.event_bus import EventBus
+from app.lighting.service import LightService
+from app.lighting.wiz import WizLightBackend
 from app.memory.history import History
 from app.speech.base import SpeechBackend
 from app.speech.elevenlabs import ElevenLabsSpeech
 from app.speech.player import TerminalPlayer
 from app.speech.service import SpeechService
+from app.speech.style import rgb_for
 
 logger = logging.getLogger("ai_council.factory")
 
@@ -42,6 +45,7 @@ class CouncilBuild:
     console: Console
     agent_modes: dict[str, str]  # name -> "live (<model>)" | "mock"
     speech_mode: str  # "elevenlabs (<model>)" | "terminal"
+    lighting_mode: str  # "wiz · <ip>" | "off"
 
 
 def build_council(settings: Settings | None = None, *, console: Console | None = None) -> CouncilBuild:
@@ -60,6 +64,8 @@ def build_council(settings: Settings | None = None, *, console: Console | None =
 
     backend, speech_mode = _build_speech_backend(settings, profiles, console)
     speech_service = SpeechService(bus, backend)
+
+    light_service, lighting_mode = _build_light_service(settings, profiles, bus)
 
     moderator = Moderator(
         bus,
@@ -81,6 +87,7 @@ def build_council(settings: Settings | None = None, *, console: Console | None =
         scheduler=scheduler,
         history=history,
         speech_service=speech_service,
+        light_service=light_service,
     )
     return CouncilBuild(
         council=council,
@@ -88,7 +95,27 @@ def build_council(settings: Settings | None = None, *, console: Console | None =
         console=console,
         agent_modes=agent_modes,
         speech_mode=speech_mode,
+        lighting_mode=lighting_mode,
     )
+
+
+def _build_light_service(
+    settings: Settings,
+    profiles: dict[str, AgentProfile],
+    bus: EventBus,
+) -> tuple[LightService | None, str]:
+    """Attach a WiZ bulb to the speech event stream when one is configured."""
+    ip = (settings.wiz_bulb_ip or "").strip()
+    if not ip:
+        return None, "off"
+    try:
+        backend = WizLightBackend(ip, off_on_close=settings.wiz_off_on_exit)
+        colors = {name: rgb_for(name) for name in profiles}
+        service = LightService(bus, backend, colors)
+        return service, f"wiz · {ip}"
+    except Exception as exc:  # noqa: BLE001 — missing dep / bad IP → no lighting
+        logger.warning("WiZ lighting init failed (%s); running without lights", exc)
+        return None, "off"
 
 
 def _build_speech_backend(
@@ -113,6 +140,7 @@ def _build_speech_backend(
                 settings.elevenlabs_api_key,
                 voice_ids,
                 model_id=settings.elevenlabs_model,
+                device=settings.audio_output_device or None,
                 console=console,
             )
             return backend, f"elevenlabs · {settings.elevenlabs_model}"

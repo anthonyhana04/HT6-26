@@ -124,7 +124,7 @@ def _print_banner(build: CouncilBuild) -> None:
             border_style="blue",
         )
     )
-    console.print(f"[dim]Speech: {build.speech_mode}[/]")
+    console.print(f"[dim]Speech: {build.speech_mode}   Lights: {build.lighting_mode}[/]")
     console.print("[dim]Type /help for commands. Ctrl-C or /quit to exit.[/]\n")
 
 

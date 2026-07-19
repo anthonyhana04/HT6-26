@@ -13,6 +13,7 @@ from app.council.moderator import Moderator
 from app.council.scheduler import Scheduler
 from app.events.event_bus import EventBus
 from app.events.event_types import ConversationEnded, UserMessage
+from app.lighting.service import LightService
 from app.memory.history import History
 from app.speech.service import SpeechService
 
@@ -29,6 +30,7 @@ class Council:
         scheduler: Scheduler,
         history: History,
         speech_service: SpeechService,
+        light_service: LightService | None = None,
         default_conversation_id: str = "main",
     ) -> None:
         self._bus = bus
@@ -37,6 +39,7 @@ class Council:
         self._scheduler = scheduler
         self._history = history
         self._speech = speech_service
+        self._light = light_service
         self._default_conversation_id = default_conversation_id
         # Materialize the default conversation eagerly so it always exists.
         self._history.get_or_create(default_conversation_id)
@@ -61,3 +64,5 @@ class Council:
         cid = conversation_id or self._default_conversation_id
         await self._bus.publish(ConversationEnded(conversation_id=cid, reason=reason))
         await self._speech.aclose()
+        if self._light is not None:
+            await self._light.aclose()
