@@ -18,5 +18,7 @@ numpy>=1.26           # RMS amplitude metering for the LED event stream
 # Lighting (WiZ smart bulb over UDP) — optional hardware peripheral
 pywizlight>=0.5
 
-# Future (API) — declared now so the architecture is honest about intent.
-# fastapi>=0.111
+# Web mic (phone-as-microphone → speech-to-text → council)
+fastapi>=0.111
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9

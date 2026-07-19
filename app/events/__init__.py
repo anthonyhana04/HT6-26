@@ -5,6 +5,8 @@ from app.events.event_bus import EventBus, Subscription
 from app.events.event_types import (
     ConversationEnded,
     InterruptRequest,
+    ListeningStateChanged,
+    UserBargeIn,
     ProposalAccepted,
     ProposalCreated,
     ProposalRejected,
@@ -27,6 +29,8 @@ __all__ = [
     "ProposalRejected",
     "SpeechQueued",
     "InterruptRequest",
+    "ListeningStateChanged",
+    "UserBargeIn",
     "SpeakEvent",
     "SpeechStarted",
     "SpeechProgress",

@@ -65,16 +65,54 @@ def test_confidence_threshold_filters() -> None:
 
 
 def test_lead_opens_and_targets_follow_their_referent() -> None:
-    """Lead speaks first; a correction targeting Groq is ordered after Groq."""
+    """Lead speaks first; a correction targeting Grok is ordered after Grok."""
     arb = Arbitrator(LEAD)
     result = arb.select(
         [
             _p(LEAD, True, 70, Intent.ANSWER),
-            _p("Groq", True, 90, Intent.DISAGREEMENT),
-            _p("Anthropic", True, 85, Intent.CORRECTION, target="Groq"),
+            _p("Grok", True, 90, Intent.DISAGREEMENT),
+            _p("Anthropic", True, 85, Intent.CORRECTION, target="Grok"),
         ],
         ArbitrationPolicy(min_confidence=55, max_speakers=3, dominance_gap=25),
     )
     order = [p.agent for p in result.accepted]
     assert order[0] == LEAD  # lead opens despite lower confidence
-    assert order.index("Anthropic") > order.index("Groq")  # correction follows target
+    assert order.index("Anthropic") > order.index("Grok")  # correction follows target
+
+
+def test_preferred_peer_beats_other_peers_in_close_calls() -> None:
+    """Grok is preferred over Anthropic when confidences are close."""
+    arb = Arbitrator(LEAD, preferred_peer="Grok")
+    result = arb.select(
+        [
+            _p(LEAD, True, 70, Intent.ANSWER),
+            _p("Anthropic", True, 82, Intent.OBSERVATION),
+            _p("Grok", True, 78, Intent.DISAGREEMENT),
+        ],
+        ArbitrationPolicy(min_confidence=55, max_speakers=3, dominance_gap=25),
+    )
+    order = [p.agent for p in result.accepted]
+    assert order[0] == LEAD
+    assert order.index("Grok") < order.index("Anthropic")
+
+
+def test_non_lead_solo_does_not_silence_preferred_peer() -> None:
+    """Anthropic's dominant answer cannot mute Grok; Lead solo still can."""
+    arb = Arbitrator(LEAD, preferred_peer="Grok")
+    peer_solo = arb.select(
+        [
+            _p("Anthropic", True, 95, Intent.ANSWER),
+            _p("Grok", True, 60, Intent.DISAGREEMENT),
+        ],
+        ArbitrationPolicy(min_confidence=55, max_speakers=3, dominance_gap=25),
+    )
+    assert {p.agent for p in peer_solo.accepted} == {"Anthropic", "Grok"}
+
+    lead_solo = arb.select(
+        [
+            _p(LEAD, True, 95, Intent.ANSWER),
+            _p("Grok", True, 60, Intent.DISAGREEMENT),
+        ],
+        ArbitrationPolicy(min_confidence=55, max_speakers=3, dominance_gap=25),
+    )
+    assert [p.agent for p in lead_solo.accepted] == [LEAD]

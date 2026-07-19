@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>AI Council — Mic</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 24px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: radial-gradient(1200px 800px at 50% -10%, #1b2440, #0a0d18 60%);
+    color: #e8ecf5; padding: 32px 20px;
+  }
+  h1 { font-size: 22px; font-weight: 600; letter-spacing: .3px; margin: 0; opacity: .95; }
+  .sub { font-size: 14px; opacity: .55; margin-top: -12px; text-align: center; max-width: 300px; line-height: 1.4; }
+  #orb {
+    width: 180px; height: 180px; border-radius: 50%; border: none; cursor: pointer;
+    background: linear-gradient(145deg, #2a3358, #1a2140);
+    box-shadow: 0 10px 40px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.06);
+    color: #fff; font-size: 16px; font-weight: 600; line-height: 1.35;
+    display: flex; align-items: center; justify-content: center; text-align: center;
+    transition: background .2s ease, box-shadow .2s ease, transform .12s ease;
+  }
+  #orb:active { transform: scale(.97); }
+  #orb.recording {
+    background: linear-gradient(145deg, #b0324a, #7c1f33);
+    animation: pulse 1.3s infinite;
+  }
+  #orb.busy {
+    background: linear-gradient(145deg, #6a4a2a, #402818);
+  }
+  #orb.uploading {
+    background: linear-gradient(145deg, #2a6a4a, #184030);
+  }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(220,60,90,.5); }
+    70% { box-shadow: 0 0 0 22px rgba(220,60,90,0); }
+    100% { box-shadow: 0 0 0 0 rgba(220,60,90,0); }
+  }
+  #status { font-size: 14px; opacity: .75; min-height: 22px; text-align: center; }
+  #transcript {
+    max-width: 520px; width: 100%; min-height: 54px; padding: 14px 16px;
+    border-radius: 14px; background: rgba(255,255,255,.04);
+    border: 1px solid rgba(255,255,255,.08); font-size: 15px; line-height: 1.4;
+    opacity: 0; transition: opacity .2s ease;
+  }
+  #transcript.show { opacity: 1; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#4ade80; margin-right:6px; vertical-align: middle; }
+  .dot.warn { background:#fbbf24; }
+  .dot.off { background:#64748b; }
+  .meta { font-size: 12px; opacity: .4; text-align: center; }
+  .hint { font-size: 12px; opacity: .4; text-align: center; max-width: 300px; }
+</style>
+</head>
+<body>
+  <h1>AI Council</h1>
+  <div class="sub">Tap to speak, tap again to send. Tap while they’re talking to interrupt.<br/><span style="opacity:.7">mic v3 · wav</span></div>
+  <button id="orb">Tap to<br/>speak</button>
+  <div id="status"><span class="dot" id="dot"></span><span id="statusText">ready</span></div>
+  <div id="transcript"></div>
+  <div class="meta" id="meta"></div>
+  <div class="hint">Keep this page open. Lamp follows whoever is speaking.</div>
+
+<script>
+const orb = document.getElementById('orb');
+const statusText = document.getElementById('statusText');
+const dot = document.getElementById('dot');
+const transcriptEl = document.getElementById('transcript');
+const metaEl = document.getElementById('meta');
+
+// Record PCM → WAV. Phone Safari MediaRecorder mp4/webm blobs are often
+// rejected by ElevenLabs STT as "corrupted"; WAV is universally accepted.
+const TARGET_RATE = 16000;
+const MIN_MS = 350;
+
+let stream = null;
+let audioCtx = null;
+let sourceNode = null;
+let processor = null;
+let muteGain = null;
+let pcmChunks = [];
+let recording = false;
+let uploading = false;
+let serverListening = 'idle';
+let recordStartedAt = 0;
+
+function setUi(mode, label, buttonHtml) {
+  orb.className = mode || '';
+  statusText.textContent = label;
+  if (buttonHtml) orb.innerHTML = buttonHtml;
+  if (mode === 'busy' || mode === 'uploading') dot.className = 'dot warn';
+  else if (mode === 'recording') dot.className = 'dot';
+  else dot.className = 'dot';
+}
+
+function syncUi() {
+  if (uploading) {
+    setUi('uploading', 'transcribing…', 'Sending…');
+    return;
+  }
+  if (recording) {
+    setUi('recording', 'recording — tap to send', 'Tap to<br/>send');
+    return;
+  }
+  if (serverListening === 'busy') {
+    setUi('busy', 'council speaking — tap to interrupt', 'Tap to<br/>interrupt');
+    return;
+  }
+  setUi('', 'ready', 'Tap to<br/>speak');
+}
+
+async function refreshHealth() {
+  try {
+    const r = await fetch('/api/health');
+    const j = await r.json();
+    serverListening = j.listening || (j.busy ? 'busy' : 'idle');
+    metaEl.textContent = `voice: ${j.speech}  ·  lights: ${j.lights}  ·  stt: ${j.stt}`;
+    if (!recording && !uploading) syncUi();
+  } catch (e) {
+    if (!recording) setUi('', 'offline', 'Tap to<br/>speak');
+  }
+}
+
+async function ensureMic() {
+  if (stream) return stream;
+  stream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+      channelCount: 1,
+    },
+  });
+  return stream;
+}
+
+function downsample(float32, fromRate, toRate) {
+  if (fromRate === toRate) return float32;
+  const ratio = fromRate / toRate;
+  const outLen = Math.max(1, Math.floor(float32.length / ratio));
+  const out = new Float32Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const idx = Math.floor(i * ratio);
+    out[i] = float32[idx];
+  }
+  return out;
+}
+
+function encodeWav(floatChunks, sampleRate) {
+  let total = 0;
+  for (const c of floatChunks) total += c.length;
+  const merged = new Float32Array(total);
+  let offset = 0;
+  for (const c of floatChunks) {
+    merged.set(c, offset);
+    offset += c.length;
+  }
+  const pcm = downsample(merged, sampleRate, TARGET_RATE);
+  const dataLen = pcm.length * 2;
+  const buf = new ArrayBuffer(44 + dataLen);
+  const view = new DataView(buf);
+  const writeStr = (o, s) => { for (let i = 0; i < s.length; i++) view.setUint8(o + i, s.charCodeAt(i)); };
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + dataLen, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, 1, true); // mono
+  view.setUint32(24, TARGET_RATE, true);
+  view.setUint32(28, TARGET_RATE * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, 'data');
+  view.setUint32(40, dataLen, true);
+  let o = 44;
+  for (let i = 0; i < pcm.length; i++, o += 2) {
+    const s = Math.max(-1, Math.min(1, pcm[i]));
+    view.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
+function teardownCapture() {
+  try { if (processor) processor.disconnect(); } catch (e) {}
+  try { if (muteGain) muteGain.disconnect(); } catch (e) {}
+  try { if (sourceNode) sourceNode.disconnect(); } catch (e) {}
+  processor = null;
+  muteGain = null;
+  sourceNode = null;
+}
+
+async function startRecording() {
+  try {
+    const s = await ensureMic();
+    if (serverListening === 'busy') {
+      fetch('/api/hearing/barge-in', { method: 'POST' }).catch(() => {});
+      serverListening = 'awaiting_command';
+    }
+    pcmChunks = [];
+    const AC = window.AudioContext || window.webkitAudioContext;
+    // Don't force sampleRate — iOS often ignores/rejects it; we downsample later.
+    if (!audioCtx || audioCtx.state === 'closed') {
+      audioCtx = new AC();
+    }
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+    sourceNode = audioCtx.createMediaStreamSource(s);
+    // ScriptProcessor is deprecated but is the reliable path on iOS Safari.
+    processor = audioCtx.createScriptProcessor(4096, 1, 1);
+    muteGain = audioCtx.createGain();
+    muteGain.gain.value = 0;
+    processor.onaudioprocess = (ev) => {
+      if (!recording) return;
+      const input = ev.inputBuffer.getChannelData(0);
+      pcmChunks.push(new Float32Array(input));
+    };
+    sourceNode.connect(processor);
+    processor.connect(muteGain);
+    muteGain.connect(audioCtx.destination);
+
+    recording = true;
+    recordStartedAt = Date.now();
+    syncUi();
+  } catch (e) {
+    teardownCapture();
+    setUi('', 'mic blocked — allow microphone access', 'Tap to<br/>speak');
+  }
+}
+
+function stopRecording() {
+  if (!recording) return;
+  recording = false;
+  const sampleRate = audioCtx ? audioCtx.sampleRate : TARGET_RATE;
+  const chunks = pcmChunks;
+  pcmChunks = [];
+  teardownCapture();
+  syncUi();
+  sendAudio(chunks, sampleRate);
+}
+
+async function sendAudio(chunks, sampleRate) {
+  const elapsed = Date.now() - recordStartedAt;
+  if (!chunks.length || elapsed < MIN_MS) {
+    statusText.textContent = 'hold a bit longer, then tap send';
+    syncUi();
+    return;
+  }
+  uploading = true;
+  syncUi();
+  const blob = encodeWav(chunks, sampleRate);
+  const fd = new FormData();
+  fd.append('audio', blob, 'clip.wav');
+  try {
+    const r = await fetch('/api/hearing/utterance', { method: 'POST', body: fd });
+    const j = await r.json();
+    if (j.listening) serverListening = j.listening;
+    if (j.status === 'submitted') {
+      transcriptEl.textContent = '“' + j.transcript + '”';
+      transcriptEl.classList.add('show');
+    } else if (j.status === 'no_speech') {
+      statusText.textContent = "didn't catch that — try again";
+    } else if (j.error && r.status !== 409) {
+      statusText.textContent = j.error;
+    }
+  } catch (e) {
+    statusText.textContent = 'send failed';
+  } finally {
+    uploading = false;
+    syncUi();
+  }
+}
+
+orb.addEventListener('click', () => {
+  if (uploading) return;
+  if (recording) stopRecording();
+  else startRecording();
+});
+
+refreshHealth();
+setInterval(refreshHealth, 1500);
+</script>
+</body>
+</html>

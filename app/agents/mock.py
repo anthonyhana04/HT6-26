@@ -35,7 +35,7 @@ ROLE_BRUTALIST = "Brutalist"
 # agents never depend on the config layer. If they no longer match, reactions
 # simply don't fire (the engine degrades gracefully).
 _LEAD_NAME = "Gemini"
-_BRUTALIST_NAME = "Groq"
+_BRUTALIST_NAME = "Grok"
 
 
 class MockAgent(BaseAgent):
@@ -99,16 +99,17 @@ class MockAgent(BaseAgent):
         ):
             return self._pass("Nothing to interrupt about.")
 
-        # Characteristic reactions, by role. The Brutalist reliably pushes back
-        # on the Lead's opening; the Second Guesser probes it; the Thinker reacts
-        # to the Brutalist below the interrupt bar so the moderator filters it.
+        # Sparse reactions — most interrupt rounds stay quiet.
         role = self.role
         if role == ROLE_BRUTALIST and speaking.speaker == _LEAD_NAME:
-            return self._bid(82, Intent.CORRECTION, "The Lead glossed over execution risk.", target=_LEAD_NAME)
+            return self._bid(
+                72,
+                Intent.DISAGREEMENT,
+                "Lead's take is soft — one pushback.",
+                target=_LEAD_NAME,
+            )
         if role == ROLE_SECOND_GUESSER and speaking.speaker == _LEAD_NAME:
             return self._bid(78, Intent.QUESTION, "The Lead's framing skips an edge case.", target=_LEAD_NAME)
-        if role == ROLE_THINKER and speaking.speaker == _BRUTALIST_NAME:
-            return self._bid(70, Intent.OBSERVATION, "The Brutalist's push is right but misses second-order effects.", target=_BRUTALIST_NAME)
         return self._pass("Content to let it stand.")
 
     # -- phase 2 ------------------------------------------------------------- #

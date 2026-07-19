@@ -52,8 +52,10 @@ class ArbitrationPolicy:
 class Arbitrator:
     """Ranks proposals into an ordered, deduplicated speaking list."""
 
-    def __init__(self, lead_name: str) -> None:
+    def __init__(self, lead_name: str, *, preferred_peer: str | None = None) -> None:
         self._lead_name = lead_name
+        # When peers are close, prefer this member (Grok) over the others.
+        self._preferred_peer = preferred_peer
 
     def select(self, proposals: list[Proposal], policy: ArbitrationPolicy) -> Selection:
         rejected: list[RejectedProposal] = []
@@ -75,10 +77,18 @@ class Arbitrator:
         ranked = sorted(candidates, key=self._rank_key, reverse=True)
 
         # Solo-answer collapse: a confident, dominant answer speaks alone.
+        # Lead may still take the floor alone. A non-Lead peer answer must not
+        # silence the preferred peer (Grok) — they talk more than other models.
         top = ranked[0]
         if top.intent in _SOLO_INTENTS:
             runner_up = ranked[1] if len(ranked) > 1 else None
-            if runner_up is None or (top.confidence - runner_up.confidence) >= policy.dominance_gap:
+            gap_ok = runner_up is None or (
+                self._effective_confidence(top) - self._effective_confidence(runner_up)
+            ) >= policy.dominance_gap
+            preferred_waiting = any(
+                p.agent == self._preferred_peer for p in ranked[1:] if self._preferred_peer
+            )
+            if gap_ok and not (preferred_waiting and top.agent != self._lead_name):
                 for loser in ranked[1:]:
                     rejected.append(RejectedProposal(loser, "deferred to a dominant answer"))
                 return Selection(accepted=[top], rejected=rejected)
@@ -93,18 +103,35 @@ class Arbitrator:
 
     # -- ordering ------------------------------------------------------------ #
 
-    def _rank_key(self, proposal: Proposal) -> tuple[int, int, int]:
-        """Sort by confidence, then lead priority, then a stable intent weight."""
+    def _effective_confidence(self, proposal: Proposal) -> int:
+        """Confidence with a small bump for the preferred peer (Grok)."""
+        if proposal.agent == self._preferred_peer:
+            return proposal.confidence + 8
+        return proposal.confidence
+
+    def _rank_key(self, proposal: Proposal) -> tuple[int, int, int, int]:
+        """Sort by confidence, lead, preferred peer (Grok), then intent weight."""
         lead_priority = 1 if proposal.agent == self._lead_name else 0
-        return (proposal.confidence, lead_priority, _intent_weight(proposal.intent))
+        peer_boost = 1 if proposal.agent == self._preferred_peer else 0
+        return (
+            self._effective_confidence(proposal),
+            lead_priority,
+            peer_boost,
+            _intent_weight(proposal.intent),
+        )
 
     def _order(self, proposals: list[Proposal]) -> list[Proposal]:
-        """Lead opens; then confidence order; then respect reply targets."""
+        """Lead opens; then preferred peer; then confidence; then reply targets."""
         lead_openers = [
             p for p in proposals if p.agent == self._lead_name and p.intent in _LEAD_OPENING_INTENTS
         ]
         rest = [p for p in proposals if p not in lead_openers]
-        rest.sort(key=lambda p: p.confidence, reverse=True)
+
+        def _peer_key(p: Proposal) -> tuple[int, int]:
+            preferred = 1 if p.agent == self._preferred_peer else 0
+            return (preferred, p.confidence)
+
+        rest.sort(key=_peer_key, reverse=True)
         ordered = lead_openers + rest
         return _respect_targets(ordered)
 

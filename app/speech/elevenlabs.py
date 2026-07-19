@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, AsyncIterator
 
 from rich.console import Console
@@ -32,6 +33,10 @@ logger = logging.getLogger("ai_council.speech.elevenlabs")
 # PCM sample rate we request from ElevenLabs and play back at.
 _SAMPLE_RATE = 24_000
 _OUTPUT_FORMAT = "pcm_24000"
+# Bluetooth / PipeWire often buffers ahead of the speaker. After the last PCM
+# byte is queued we still wait this small pad so SpeechFinished doesn't fire
+# a hair early. Keep it tight — next-speaker LLM work is overlapped separately.
+_PLAYBACK_PAD_S = 0.12
 
 
 class ElevenLabsSpeech(SpeechBackend):
@@ -61,6 +66,8 @@ class ElevenLabsSpeech(SpeechBackend):
         self._voice_ids: dict[str, str | None] = dict(voice_ids)
         self._voices_ready = False
         self._audio_ok = True  # flips off if no output device is available
+        self._active_player: _AudioPlayer | None = None
+        self._aborted = False
 
     @property
     def name(self) -> str:
@@ -69,8 +76,16 @@ class ElevenLabsSpeech(SpeechBackend):
     def voice_for(self, speaker: str) -> str | None:
         return self._voice_ids.get(speaker)
 
+    def abort(self) -> None:
+        """Hard-stop current playback (user barge-in)."""
+        self._aborted = True
+        player = self._active_player
+        if player is not None:
+            player.abort()
+
     async def stream(self, event: SpeakEvent) -> AsyncIterator[SpeechChunk]:
         self._print_header(event)
+        self._aborted = False
         text = event.text.strip()
         if not text:
             return
@@ -86,6 +101,7 @@ class ElevenLabsSpeech(SpeechBackend):
         if player is not None and not player.ok:
             self._audio_ok = False
             player = None
+        self._active_player = player
 
         try:
             audio_stream = self._client.text_to_speech.stream(
@@ -95,12 +111,19 @@ class ElevenLabsSpeech(SpeechBackend):
                 output_format=_OUTPUT_FORMAT,
             )
             async for chunk in audio_stream:
+                if self._aborted:
+                    break
                 if not chunk:
                     continue
                 if player is not None:
                     await player.write(chunk)
                 yield SpeechChunk(amplitude=_rms_amplitude(chunk), audio=chunk, text_segment=None)
+            # Hold the turn until the speaker has actually finished — not just
+            # until the last PCM byte was handed to the OS audio buffer.
+            if player is not None and not self._aborted:
+                await player.drain()
         finally:
+            self._active_player = None
             if player is not None:
                 await player.close()
 
@@ -139,11 +162,20 @@ class ElevenLabsSpeech(SpeechBackend):
 
 
 class _AudioPlayer:
-    """Thin real-time PCM player over sounddevice; no-ops if audio is absent."""
+    """Thin real-time PCM player over sounddevice; no-ops if audio is absent.
+
+    PipeWire/Bluetooth often accept ``write()`` faster than the speaker plays.
+    We track PCM duration and :meth:`drain` sleeps until that audio should have
+    left the speaker, so the scheduler never starts the next member early.
+    """
 
     def __init__(self, sample_rate: int, device: str | int | None = None) -> None:
         self._stream = None
         self.ok = False
+        self._sample_rate = sample_rate
+        self._bytes_written = 0
+        self._started_at: float | None = None
+        self._aborted = False
         try:
             import sounddevice as sd
 
@@ -158,11 +190,41 @@ class _AudioPlayer:
         except Exception:  # noqa: BLE001 — headless/CI or no PortAudio device
             logger.warning("Audio output unavailable; speaking silently", exc_info=True)
 
+    def abort(self) -> None:
+        """Drop the output stream immediately (barge-in)."""
+        self._aborted = True
+        stream, self._stream = self._stream, None
+        if stream is None:
+            return
+        try:
+            abort = getattr(stream, "abort", None)
+            if abort is not None:
+                abort()
+            else:
+                stream.stop()
+            stream.close()
+        except Exception:  # noqa: BLE001
+            pass
+
     async def write(self, chunk: bytes) -> None:
         if self._stream is None:
             return
+        if self._started_at is None:
+            self._started_at = time.monotonic()
+        self._bytes_written += len(chunk)
         # Blocking write paces playback to real time; keep the loop responsive.
         await asyncio.to_thread(self._stream.write, chunk)
+
+    async def drain(self) -> None:
+        """Wait until queued PCM should have finished playing from the speaker."""
+        if self._aborted or self._started_at is None or self._bytes_written <= 0:
+            return
+        # 16-bit mono PCM → 2 bytes per sample.
+        duration_s = self._bytes_written / (self._sample_rate * 2)
+        remaining = duration_s - (time.monotonic() - self._started_at) + _PLAYBACK_PAD_S
+        if remaining > 0:
+            logger.debug("Draining speaker for %.2fs before next turn", remaining)
+            await asyncio.sleep(remaining)
 
     async def close(self) -> None:
         if self._stream is None:

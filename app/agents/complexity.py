@@ -5,7 +5,7 @@ they aren't needed. This module answers one narrow question — "roughly how
 much effort does this message warrant?" — and both the offline
 :class:`~app.agents.mock.MockAgent` and every live provider agent use it to size
 their token budgets, so a "what is 2+2?" costs a sentence and a "should I quit
-school to start a company?" gets the room it needs.
+school to start a company?" still stays to a tight spoken turn — never a rant.
 
 This is deliberately *not* a moderator concern: the moderator decides *who*
 speaks; this decides *how much room* whoever speaks should be given.
@@ -33,8 +33,9 @@ _DECISION_MARKERS = (
 # Token ceilings per complexity tier. These are the *effective* caps used by
 # BaseAgent; an AgentProfile's own max_tokens fields act as an outer sanity
 # ceiling on top of these (see BaseAgent.propose/generate).
-PROPOSAL_TOKENS: dict[Complexity, int] = {"trivial": 150, "open": 320}
-GENERATION_TOKENS: dict[Complexity, int] = {"trivial": 120, "open": 420}
+PROPOSAL_TOKENS: dict[Complexity, int] = {"trivial": 150, "open": 280}
+# Spoken turns must stay short. ~80 tokens ≈ 1–2 sentences; ~180 ≈ a tight 2–3.
+GENERATION_TOKENS: dict[Complexity, int] = {"trivial": 80, "open": 180}
 
 
 def classify(text: str) -> Complexity:

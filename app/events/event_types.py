@@ -90,6 +90,30 @@ class InterruptRequest(Event):
 
 
 # --------------------------------------------------------------------------- #
+# Listening (phone mic → council)
+# --------------------------------------------------------------------------- #
+
+
+class ListeningStateChanged(Event):
+    """The microphone front-end changed listening mode.
+
+    ``state`` is one of:
+      * ``idle`` — ready for the next tap-to-talk (lamp off)
+      * ``awaiting_command`` — user interrupted; white lamp while they record
+      * ``busy`` — a council turn is running
+    """
+
+    state: str  # idle | awaiting_command | busy
+
+
+class UserBargeIn(Event):
+    """The user started talking over the council — stop current speech."""
+
+    conversation_id: str = "main"
+    reason: str = "user spoke"
+
+
+# --------------------------------------------------------------------------- #
 # Speech layer (the ONLY events peripherals like TTS / LEDs care about)
 # --------------------------------------------------------------------------- #
 

@@ -1,23 +1,14 @@
-"""The lighting layer's bus adapter — turns speech events into light.
+"""The lighting layer's bus adapter — turns speech + listening events into light.
 
-This is the LED lamp the architecture always promised: a pure *subscriber* to
-the speech lifecycle. It listens to the same three events the terminal and
-voices produce and drives a physical light:
+A pure *subscriber* to the event bus:
 
+    ListeningStateChanged(awaiting_command) → solid white (user interrupted, recording)
     SpeechStarted   → bulb switches to the speaker's colour
     SpeechProgress  → brightness pulses with the voice amplitude
-    SpeechFinished  → bulb turns off (idle)
+    SpeechFinished  → bulb turns off (unless still awaiting a command)
 
-Two design decisions keep it safe:
-
-* **Handlers are synchronous and instant.** They only record the desired light
-  state and wake a worker. They never ``await`` the (UDP, ~tens of ms) bulb call
-  inside :meth:`EventBus.publish`, which would otherwise stall audio playback.
-* **A coalescing worker** applies only the *latest* desired state. Rapid
-  amplitude updates collapse into "converge to newest" instead of a backlog, so
-  the bulb never lags behind the conversation.
-
-The council core knows nothing about any of this.
+Handlers stay synchronous and instant; a coalescing worker applies hardware
+updates so the audio path is never stalled by UDP bulb calls.
 """
 
 from __future__ import annotations
@@ -27,15 +18,19 @@ import logging
 from dataclasses import dataclass
 
 from app.events.event_bus import EventBus
-from app.events.event_types import SpeechFinished, SpeechProgress, SpeechStarted
+from app.events.event_types import (
+    ListeningStateChanged,
+    SpeechFinished,
+    SpeechProgress,
+    SpeechStarted,
+)
 from app.lighting.base import RGB, LightBackend
 
 logger = logging.getLogger("ai_council.lighting")
 
-# Amplitude (0..1) maps into this brightness band so the bulb always stays
-# clearly lit while still visibly pulsing with the voice.
 _MIN_BRIGHTNESS = 80
 _MAX_BRIGHTNESS = 255
+_WAKE_WHITE: RGB = (255, 255, 255)
 
 
 @dataclass(frozen=True)
@@ -46,7 +41,7 @@ class _LightState:
 
 
 class LightService:
-    """Drives a :class:`LightBackend` from the speech event stream."""
+    """Drives a :class:`LightBackend` from speech + listening events."""
 
     def __init__(
         self,
@@ -64,9 +59,11 @@ class LightService:
         self._target: _LightState | None = None
         self._dirty = asyncio.Event()
         self._worker: asyncio.Task[None] | None = None
+        self._listening_state = "idle"
         self._last_brightness = -1
 
         self._subs = [
+            bus.subscribe(ListeningStateChanged, self._on_listening),
             bus.subscribe(SpeechStarted, self._on_started),
             bus.subscribe(SpeechProgress, self._on_progress),
             bus.subscribe(SpeechFinished, self._on_finished),
@@ -76,7 +73,16 @@ class LightService:
     def backend(self) -> LightBackend:
         return self._backend
 
-    # -- event handlers (sync + instant: only set state, never await hw) ----- #
+    # -- event handlers (sync + instant) ------------------------------------- #
+
+    def _on_listening(self, event: ListeningStateChanged) -> None:
+        self._listening_state = event.state
+        if event.state == "awaiting_command":
+            # User interrupted — solid white while they finish their clip.
+            self._set_target(_LightState(on=True, rgb=_WAKE_WHITE, brightness=_MAX_BRIGHTNESS))
+        elif event.state == "idle":
+            self._last_brightness = -1
+            self._set_target(_LightState(on=False, rgb=self._default_color, brightness=0))
 
     def _on_started(self, event: SpeechStarted) -> None:
         rgb = self._colors.get(event.speaker, self._default_color)
@@ -85,7 +91,6 @@ class LightService:
     def _on_progress(self, event: SpeechProgress) -> None:
         rgb = self._colors.get(event.speaker, self._default_color)
         brightness = _amplitude_to_brightness(event.amplitude)
-        # Skip micro-changes to avoid needless bulb chatter / flicker.
         if abs(brightness - self._last_brightness) < 12:
             return
         self._last_brightness = brightness
@@ -93,7 +98,14 @@ class LightService:
 
     def _on_finished(self, event: SpeechFinished) -> None:
         self._last_brightness = -1
+        # Between speakers the lamp goes dark briefly. If we're still waiting
+        # for a question after a wake, keep the white "listening" light on.
+        if self._listening_state == "awaiting_command":
+            self._set_target(_LightState(on=True, rgb=_WAKE_WHITE, brightness=_MAX_BRIGHTNESS))
+            return
         self._set_target(_LightState(on=False, rgb=self._default_color, brightness=0))
+
+    # -- coalescing worker --------------------------------------------------- #
 
     def _set_target(self, state: _LightState) -> None:
         self._target = state
@@ -105,10 +117,7 @@ class LightService:
             try:
                 self._worker = asyncio.get_running_loop().create_task(self._run())
             except RuntimeError:
-                # No running loop (shouldn't happen from a bus handler); ignore.
                 pass
-
-    # -- coalescing worker: applies only the newest desired state ------------ #
 
     async def _run(self) -> None:
         while True:
@@ -122,7 +131,7 @@ class LightService:
                     await self._backend.set_color(state.rgb, state.brightness)
                 else:
                     await self._backend.off()
-            except Exception:  # noqa: BLE001 — hardware is best-effort, never fatal
+            except Exception:  # noqa: BLE001
                 logger.debug("Light update failed", exc_info=True)
 
     async def aclose(self) -> None:

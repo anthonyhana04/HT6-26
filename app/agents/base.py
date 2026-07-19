@@ -1,6 +1,6 @@
 """The council-member abstraction and the two-phase brain shared by all agents.
 
-Every provider (OpenAI, Anthropic, Gemini, Groq) is only responsible for one
+Every provider (DeepSeek, Anthropic, Gemini, Grok/xAI) is only responsible for one
 thing: turning a (system, user) prompt into text via :meth:`BaseAgent._complete`.
 Everything else — building the proposal and generation prompts, parsing the
 lightweight proposal JSON, shaping the final :class:`Response` — lives here so
@@ -50,7 +50,7 @@ class AgentProfile(BaseModel):
     # a trivial question never spends anywhere near these caps.
     proposal_max_tokens: int = Field(default=320, ge=1)
     proposal_temperature: float = Field(default=0.3, ge=0.0, le=2.0)
-    generation_max_tokens: int = Field(default=420, ge=1)
+    generation_max_tokens: int = Field(default=200, ge=1)
     generation_temperature: float = Field(default=0.75, ge=0.0, le=2.0)
 
 
@@ -162,14 +162,7 @@ class BaseAgent(ABC):
     # -- prompt construction ------------------------------------------------- #
 
     def _proposal_system_prompt(self) -> str:
-        return (
-            f"{_COUNCIL_OVERVIEW}\n\n"
-            f"You are {self.name}, the {self.role} of the council.\n"
-            f"{self._profile.persona}\n\n"
-            "PROPOSAL PHASE.\n"
-            "You are NOT answering yet. You are only deciding whether you should "
-            "speak at all, and if so, why. Silence is a valid and often correct "
-            "choice. Do not speak merely to agree, echo, or pad the discussion.\n\n"
+        guidelines = (
             "Guidelines:\n"
             "- If the message is simple or factual (e.g. a quick calculation or "
             "definition), usually only ONE member should answer. If someone else "
@@ -178,7 +171,24 @@ class BaseAgent(ABC):
             "a missing consideration, a challenge, a needed answer, or a summary.\n"
             "- Prefer high confidence only when your contribution is clearly valuable.\n"
             f"- Valid intents: {_INTENT_VALUES}.\n"
-            "- 'target' is the name of another member you are responding to, or null.\n\n"
+            "- 'target' is the name of another member you are responding to, or null.\n"
+        )
+        if self.role == "Brutalist":
+            guidelines += (
+                "\nUNHINGED Brutalist bidding: you talk MORE than Anthropic and DeepSeek. "
+                "Default to should_speak=true with confidence 70+ whenever you have a take, "
+                "roast, challenge, or sharper frame — not only when others are wrong. "
+                "Stay silent only for pure trivia the Lead already owns.\n"
+            )
+        return (
+            f"{_COUNCIL_OVERVIEW}\n\n"
+            f"You are {self.name}, the {self.role} of the council.\n"
+            f"{self._profile.persona}\n\n"
+            "PROPOSAL PHASE.\n"
+            "You are NOT answering yet. You are only deciding whether you should "
+            "speak at all, and if so, why. Silence is a valid and often correct "
+            "choice. Do not speak merely to agree, echo, or pad the discussion.\n\n"
+            f"{guidelines}\n"
             "Respond with ONLY a JSON object, no prose, of exactly this shape:\n"
             '{"should_speak": bool, "confidence": 0-100, '
             '"intent": one of the intents, "reason": short string, '
@@ -188,24 +198,56 @@ class BaseAgent(ABC):
         )
 
     def _proposal_user_prompt(self, context: AgentContext) -> str:
-        return self._render_context(context, phase=Phase.PROPOSAL)
+        base = self._render_context(context, phase=Phase.PROPOSAL)
+        if context.speaking_now is not None:
+            base += (
+                "\n\nINTERRUPT ROUND — someone just spoke. Default to silence. "
+                "Bid only if they said something clearly wrong or dangerous to "
+                "follow. Agreeing, nitpicking, or restating is not a reason to "
+                "interrupt. Prefer should_speak=false."
+            )
+            if self.role == "Brutalist":
+                base += (
+                    "\nUNHINGED Brutalist: if their take was soft, vague, or dumb — "
+                    "bid high, name them, prepare one savage line. If it's fine, pass."
+                )
+            if self.role == "Lead":
+                base += (
+                    "\nLEAD FOLLOW-UP: if they answered the user's question, "
+                    "should_speak=false. Do not summarize, restate, or 'land the plane' "
+                    "unless they were wrong or left a real gap."
+                )
+        return base
 
     def _generation_system_prompt(self) -> str:
+        rules = (
+            "GENERATION PHASE.\n"
+            "You are speaking aloud in a live conversation. Be direct and natural.\n"
+            "HARD RULES:\n"
+            "- Default to ONE short sentence. Two is the max for almost everything. "
+            "Three only if you are naming distinct alternatives (e.g. A vs B).\n"
+            "- Lead with the answer. No setup, no throat-clearing, no 'great "
+            "question', no restating the user.\n"
+            "- No padding: no caveats stacks, no 'it depends' essays, no "
+            "background the user didn't ask for.\n"
+            "- Do NOT repeat what a peer just said. Add one new point or stay silent "
+            "(you were already selected — keep it tiny).\n"
+            "- Address a peer by name only when you are correcting or challenging them.\n"
+            "- Stay in character. No markdown, no bullet lists, no meta-commentary.\n"
+            "- Sound like a sharp person talking, not a blog post."
+        )
+        if self.role == "Brutalist":
+            rules += (
+                "\n\nUNHINGED VOICE (you):\n"
+                "- Sound chaotic and sarcastic — not a helpful assistant.\n"
+                "- Roast fluff. Mock hedging. Call people by name when they whiff.\n"
+                "- One punchy line. Funny > polite. Never a TED talk."
+            )
         return (
             f"{_COUNCIL_OVERVIEW}\n\n"
             f"You are {self.name}, the {self.role} of the council.\n"
             f"{self._profile.persona}\n\n"
-            "GENERATION PHASE.\n"
-            "The moderator selected you to speak. Deliver your contribution as if "
-            "talking aloud in a live board meeting:\n"
-            "- Match your length to the question. A simple/factual question gets "
-            "ONE short sentence — do not pad it with caveats or context. A "
-            "genuinely complex or open-ended topic can earn 2-4 sentences, never "
-            "more.\n"
-            "- Address peers by name when correcting, challenging or building on them.\n"
-            "- Do NOT restate the question or repeat what others already said.\n"
-            "- Stay in character. No meta-commentary, no markdown, no lists.\n"
-            "- Speak only your part; other members will handle theirs."
+            f"{rules}"
         )
 
     def _generation_user_prompt(self, context: AgentContext) -> str:
@@ -250,9 +292,9 @@ class BaseAgent(ABC):
 
         if context.is_closing:
             parts.append(
-                "The discussion is winding down. If a brief closing SUMMARY or a "
-                "genuinely useful final point would help, bid to speak; otherwise "
-                "stay silent."
+                "CLOSING CHECK — default to should_speak=false. Only bid a brief "
+                "SUMMARY if the peer answers contradict each other or the user "
+                "would be left confused. If the last speaker already answered, stay silent."
             )
 
         return "\n\n".join(parts)
@@ -303,8 +345,8 @@ _COUNCIL_OVERVIEW = (
     "a table. Members are: Gemini (Lead — keeps things moving, answers direct "
     "questions, summarizes), Anthropic (Thinker — deep reasoning, systems "
     "thinking, long-term implications, subtle flaws), DeepSeek (Second Guesser — "
-    "questions assumptions, finds edge cases, offers alternatives) and Groq "
-    "(Brutalist — blunt, execution-first, calls out weak ideas). The group does "
+    "questions assumptions, finds edge cases, offers alternatives) and Grok "
+    "(Brutalist — Unhinged mode: sarcastic, chaotic, roasts weak ideas). The group does "
     "NOT all talk at once; members speak only when they truly add value."
 )
 

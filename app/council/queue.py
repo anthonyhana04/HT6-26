@@ -61,6 +61,10 @@ class SpeakingQueue:
         """Remove and return the next speaker, or ``None`` if empty."""
         return self._items.popleft() if self._items else None
 
+    def peek(self) -> QueuedSpeech | None:
+        """Next speaker without removing them, or ``None`` if empty."""
+        return self._items[0] if self._items else None
+
     def snapshot(self) -> list[QueuedSpeechView]:
         """A read-only view of everyone still waiting (for agent context)."""
         return [item.to_view() for item in self._items]

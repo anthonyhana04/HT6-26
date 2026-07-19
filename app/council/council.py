@@ -12,7 +12,7 @@ from app.agents.base import BaseAgent
 from app.council.moderator import Moderator
 from app.council.scheduler import Scheduler
 from app.events.event_bus import EventBus
-from app.events.event_types import ConversationEnded, UserMessage
+from app.events.event_types import ConversationEnded, UserBargeIn, UserMessage
 from app.lighting.service import LightService
 from app.memory.history import History
 from app.speech.service import SpeechService
@@ -58,6 +58,14 @@ class Council:
         conversation.add_user(text)
         await self._bus.publish(UserMessage(conversation_id=conversation.id, text=text))
         await self._scheduler.run_turn(conversation)
+
+    async def barge_in(self, *, reason: str = "user spoke") -> None:
+        """Cut off current speech and abandon the rest of the turn."""
+        self._scheduler.cancel()
+        self._speech.request_stop()
+        await self._bus.publish(
+            UserBargeIn(conversation_id=self._default_conversation_id, reason=reason)
+        )
 
     async def shutdown(self, *, conversation_id: str | None = None, reason: str = "session ended") -> None:
         """Announce the conversation end and release speech resources."""

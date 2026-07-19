@@ -33,10 +33,15 @@ ContextBuilder = Callable[[BaseAgent], AgentContext]
 @dataclass(frozen=True)
 class ModeratorConfig:
     min_confidence: int = 55
-    interrupt_confidence: int = 75
+    interrupt_confidence: int = 78
+    # Brutalist (Grok) clears a lower bar and may speak more often than peers.
+    groq_interrupt_confidence: int = 55
+    brutalist_min_confidence: int = 40
     max_speakers: int = 3
     max_turns_per_agent: int = 2
+    brutalist_max_turns: int = 3
     dominance_gap: int = 25
+    brutalist_name: str = "Grok"
 
 
 class Moderator:
@@ -47,8 +52,12 @@ class Moderator:
         self._bus = bus
         self._config = config
         self._lead = lead_name
-        self._arbitrator = Arbitrator(lead_name)
+        self._arbitrator = Arbitrator(lead_name, preferred_peer=config.brutalist_name)
         self._turn_counts: Counter[str] = Counter()
+
+    @property
+    def config(self) -> ModeratorConfig:
+        return self._config
 
     # -- fairness bookkeeping ------------------------------------------------ #
 
@@ -65,7 +74,13 @@ class Moderator:
         # ``max_turns`` ceiling still bounds the conversation as a whole.
         if agent == self._lead:
             return False
-        return self._turn_counts[agent] >= self._config.max_turns_per_agent
+        # Grok gets more airtime than Anthropic/DeepSeek.
+        cap = (
+            self._config.brutalist_max_turns
+            if agent == self._config.brutalist_name
+            else self._config.max_turns_per_agent
+        )
+        return self._turn_counts[agent] >= cap
 
     # -- proposal round ------------------------------------------------------ #
 
@@ -95,19 +110,44 @@ class Moderator:
         conversation_id: str,
         *,
         interrupt: bool = False,
+        min_confidence_override: int | None = None,
     ) -> Selection:
-        """Apply fairness + arbitration, emit decisions, return the selection."""
+        """Apply fairness + arbitration, emit decisions, return the selection.
+
+        ``min_confidence_override`` raises the interrupt bar for every agent
+        (used when only a genuinely strong second peer point may jump the Lead).
+        """
         policy = self._policy(interrupt=interrupt)
 
         # Fairness pre-filter: drop members who already hit their turn cap.
+        # Interrupts use a per-agent confidence bar (Brutalist is allowed lower).
         fair: list[Proposal] = []
         pre_rejected: list[tuple[Proposal, str]] = []
         for proposal in proposals:
             if proposal.should_speak and self._at_cap(proposal.agent):
                 pre_rejected.append((proposal, "reached fair-speaking cap this turn"))
+            elif proposal.should_speak:
+                thresh = self._confidence_threshold(
+                    proposal.agent,
+                    interrupt=interrupt,
+                    override=min_confidence_override,
+                )
+                if proposal.confidence < thresh:
+                    pre_rejected.append(
+                        (proposal, f"confidence {proposal.confidence} < {thresh}")
+                    )
+                else:
+                    fair.append(proposal)
             else:
                 fair.append(proposal)
 
+        # For interrupt rounds the bar was already applied; arbitrator just ranks.
+        if interrupt:
+            policy = ArbitrationPolicy(
+                min_confidence=0,
+                max_speakers=1,
+                dominance_gap=self._config.dominance_gap,
+            )
         selection = self._arbitrator.select(fair, policy)
 
         # Emit rejections (fairness + arbitration) and acceptances, in order.
@@ -129,15 +169,36 @@ class Moderator:
 
         return selection
 
+    def _confidence_threshold(
+        self,
+        agent: str,
+        *,
+        interrupt: bool,
+        override: int | None,
+    ) -> int:
+        if override is not None:
+            # Strong-point override still gives Grok a slight break.
+            if agent == self._config.brutalist_name:
+                return max(0, override - 10)
+            return override
+        if interrupt:
+            if agent == self._config.brutalist_name:
+                return self._config.groq_interrupt_confidence
+            return self._config.interrupt_confidence
+        if agent == self._config.brutalist_name:
+            return self._config.brutalist_min_confidence
+        return self._config.min_confidence
+
     def _policy(self, *, interrupt: bool) -> ArbitrationPolicy:
         if interrupt:
             return ArbitrationPolicy(
-                min_confidence=self._config.interrupt_confidence,
-                max_speakers=1,  # one interrupt at a time keeps order sane
+                min_confidence=0,
+                max_speakers=1,
                 dominance_gap=self._config.dominance_gap,
             )
+        # Bar already applied per-agent above; arbitrator ranks survivors.
         return ArbitrationPolicy(
-            min_confidence=self._config.min_confidence,
+            min_confidence=0,
             max_speakers=self._config.max_speakers,
             dominance_gap=self._config.dominance_gap,
         )

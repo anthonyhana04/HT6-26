@@ -16,9 +16,18 @@ from app.agents.anthropic_agent import AnthropicAgent
 from app.agents.base import AgentProfile, BaseAgent
 from app.agents.deepseek_agent import DeepSeekAgent
 from app.agents.gemini_agent import GeminiAgent
+from app.agents.grok_agent import GrokAgent
 from app.agents.groq_agent import GroqAgent
 from app.agents.mock import MockAgent
-from app.config.profiles import ANTHROPIC, DEEPSEEK, GEMINI, GROQ, LEAD_NAME, default_profiles
+from app.config.profiles import (
+    ANTHROPIC,
+    CLERK,
+    DEEPSEEK,
+    GEMINI,
+    GROK,
+    LEAD_NAME,
+    default_profiles,
+)
 from app.config.settings import Settings
 from app.council.council import Council
 from app.council.moderator import Moderator, ModeratorConfig
@@ -73,11 +82,21 @@ def build_council(settings: Settings | None = None, *, console: Console | None =
         config=ModeratorConfig(
             min_confidence=settings.min_confidence,
             interrupt_confidence=settings.interrupt_confidence,
+            groq_interrupt_confidence=settings.groq_interrupt_confidence,
+            brutalist_min_confidence=settings.brutalist_min_confidence,
             max_speakers=settings.max_speakers,
             max_turns_per_agent=settings.max_turns_per_agent,
+            brutalist_max_turns=settings.brutalist_max_turns,
+            brutalist_name=GROK,
         ),
     )
-    scheduler = Scheduler(bus, moderator, agents, max_turns=settings.max_turns)
+    scheduler = Scheduler(
+        bus,
+        moderator,
+        agents,
+        max_turns=settings.max_turns,
+        max_interrupts=settings.max_interrupts_per_turn,
+    )
     history = History()
 
     council = Council(
@@ -111,6 +130,7 @@ def _build_light_service(
     try:
         backend = WizLightBackend(ip, off_on_close=settings.wiz_off_on_exit)
         colors = {name: rgb_for(name) for name in profiles}
+        colors[CLERK] = rgb_for(CLERK)
         service = LightService(bus, backend, colors)
         return service, f"wiz · {ip}"
     except Exception as exc:  # noqa: BLE001 — missing dep / bad IP → no lighting
@@ -135,6 +155,8 @@ def _build_speech_backend(
     if want_voice and settings.elevenlabs_api_key:
         # name -> configured voice_id (None entries get auto-assigned a unique voice).
         voice_ids: dict[str, str | None] = {name: p.voice_id for name, p in profiles.items()}
+        # Neutral end-of-turn announcer (different voice from Gemini when set).
+        voice_ids[CLERK] = settings.adjourn_voice_id
         try:
             backend = ElevenLabsSpeech(
                 settings.elevenlabs_api_key,
@@ -157,11 +179,27 @@ def _build_agent(name: str, profile: AgentProfile, settings: Settings) -> tuple[
     if settings.force_mock:
         return MockAgent(profile), "mock (forced)"
 
+    # Brutalist seat: prefer xAI Grok, fall back to Groq-hosted Llama.
+    if name == GROK:
+        if settings.xai_api_key:
+            try:
+                agent = GrokAgent(profile, settings.xai_api_key)
+                return agent, f"live · {profile.model} (xAI)"
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("xAI Grok init failed for %s: %s", name, exc)
+        if settings.groq_api_key:
+            try:
+                fallback = profile.model_copy(update={"model": settings.groq_model})
+                agent = GroqAgent(fallback, settings.groq_api_key)
+                return agent, f"live · {settings.groq_model} (Groq fallback)"
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Groq fallback init failed for %s: %s", name, exc)
+        return MockAgent(profile), "mock (no XAI/GROQ key)"
+
     key, agent_cls = {
         DEEPSEEK: (settings.deepseek_api_key, DeepSeekAgent),
         ANTHROPIC: (settings.anthropic_api_key, AnthropicAgent),
         GEMINI: (settings.google_api_key, GeminiAgent),
-        GROQ: (settings.groq_api_key, GroqAgent),
     }[name]
 
     if not key:

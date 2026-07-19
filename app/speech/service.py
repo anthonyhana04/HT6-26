@@ -7,13 +7,13 @@ system (and future hardware) reacts to:
 
     SpeakEvent  →  SpeechStarted  →  SpeechProgress*  →  SpeechFinished
 
-The Raspberry Pi LED lamp will later subscribe to exactly these three events.
-Because the council awaits ``SpeechFinished`` (via ``EventBus.wait_for``), this
-adapter also guarantees the "no overlapping speakers" rule.
+``UserBargeIn`` aborts the current stream early so the user can cut the council
+off mid-sentence. ``SpeechFinished`` still fires so the scheduler unblocks.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from app.events.event_bus import EventBus
@@ -22,6 +22,7 @@ from app.events.event_types import (
     SpeechFinished,
     SpeechProgress,
     SpeechStarted,
+    UserBargeIn,
 )
 from app.speech.base import SpeechBackend
 
@@ -34,13 +35,30 @@ class SpeechService:
     def __init__(self, bus: EventBus, backend: SpeechBackend) -> None:
         self._bus = bus
         self._backend = backend
+        self._cancel = asyncio.Event()
         self._subscription = bus.subscribe(SpeakEvent, self._on_speak)
+        self._barge_sub = bus.subscribe(UserBargeIn, self._on_barge_in)
 
     @property
     def backend(self) -> SpeechBackend:
         return self._backend
 
+    def request_stop(self) -> None:
+        """Abort the in-flight speak stream (if any)."""
+        self._cancel.set()
+        abort = getattr(self._backend, "abort", None)
+        if abort is not None:
+            try:
+                abort()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _on_barge_in(self, event: UserBargeIn) -> None:
+        logger.info("Barge-in: %s", event.reason)
+        self.request_stop()
+
     async def _on_speak(self, event: SpeakEvent) -> None:
+        self._cancel.clear()
         await self._bus.publish(
             SpeechStarted(
                 conversation_id=event.conversation_id,
@@ -50,6 +68,9 @@ class SpeechService:
         )
         try:
             async for chunk in self._backend.stream(event):
+                if self._cancel.is_set():
+                    logger.info("Speech cut short for %s (barge-in)", event.speaker)
+                    break
                 await self._bus.publish(
                     SpeechProgress(
                         conversation_id=event.conversation_id,
@@ -71,5 +92,7 @@ class SpeechService:
             )
 
     async def aclose(self) -> None:
+        self._cancel.set()
         self._subscription.cancel()
+        self._barge_sub.cancel()
         await self._backend.aclose()
